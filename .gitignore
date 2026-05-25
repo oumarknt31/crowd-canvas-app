@@ -1,0 +1,33 @@
+# PyCharm / IntelliJ IDEA
+.idea/
+*.iml
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+venv/
+.venv/
+.env
+.env/
+env/
+tmp/
+.tmp/
+.claude/
+
+.DS_Store
+
+Thumbs.db
+
+*.log
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+.ipynb_checkpoints/
+
+build/
+dist/
+*.egg-info/
