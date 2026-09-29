@@ -7,13 +7,16 @@ Run with:
 
 import base64
 import io
+import hashlib
+import json
+import secrets
 from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
-from PIL import Image
+from PIL import Image, ImageOps, ImageCms
 
 # Compatibility shim for streamlit-drawable-canvas: it calls a private helper
 # `streamlit.elements.image.image_to_url` that was removed in Streamlit ≥ 1.39.
@@ -41,10 +44,11 @@ from streamlit_drawable_canvas import st_canvas  # noqa: E402
 from crowdcanvas import (
     detect_face_bbox,
     extract_subject_mask,
-    generate_crowd,
     hex_to_rgb,
     load_sprites,
 )
+
+from crowd_layout import create_layout, render_layout, print_dimensions
 
 HERE = Path(__file__).parent
 SPRITES_DIR = HERE / "Artwork people"
@@ -58,28 +62,15 @@ st.caption(
 )
 
 
-# ------- Print / display presets ---------------------------------------------
-# Each preset specifies the longest pixel side. The image's aspect ratio is
-# preserved (output_size in generate_crowd is the longest side).
+# Exact physical frames. Exports contain the artwork without stretching it.
 PRINT_PRESETS = [
-    {"label": "Preview", "longest_px": 1600,
-     "physical": "Quick preview render"},
-    {"label": "HD wallpaper", "longest_px": 1920,
-     "physical": "Fits a 1920×1080 screen"},
-    {"label": "4K wallpaper", "longest_px": 3840,
-     "physical": "Fits a 3840×2160 screen"},
-    {"label": "A4 print · 300 DPI", "longest_px": 3508,
-     "physical": "21 × 29.7 cm"},
-    {"label": "A3 print · 300 DPI", "longest_px": 4961,
-     "physical": "29.7 × 42 cm"},
-    {"label": "60 cm canvas · 250 DPI", "longest_px": 5906,
-     "physical": "≈60 cm long side"},
-    {"label": "1 m canvas · 200 DPI", "longest_px": 7874,
-     "physical": "≈1 m long side"},
-    {"label": "1.5 m canvas · 150 DPI", "longest_px": 8858,
-     "physical": "≈1.5 m long side"},
+    ("A4", 21.0, 29.7, 300),
+    ("A3", 29.7, 42.0, 300),
+    ("30 × 40 cm", 30.0, 40.0, 300),
+    ("50 × 70 cm", 50.0, 70.0, 240),
+    ("60 × 90 cm", 60.0, 90.0, 200),
+    ("70 × 100 cm", 70.0, 100.0, 200),
 ]
-
 
 # ------- Pan/zoom HTML viewer (self-contained, no JS deps) -------------------
 ZOOM_HTML_TEMPLATE = """
@@ -239,7 +230,10 @@ def render_zoom_viewer(img: Image.Image, height_px: int = 720) -> None:
     """Embed an interactive pan/zoom HTML viewer for the given image."""
     b64 = _image_to_jpeg_b64(img)
     html = ZOOM_HTML_TEMPLATE.replace("__IMAGE__", b64).replace("__HEIGHT__", str(height_px))
-    components.html(html, height=height_px + 12, scrolling=False)
+    if hasattr(st, "iframe"):
+        st.iframe(html, height=height_px + 12)
+    else:
+        components.html(html, height=height_px + 12, scrolling=False)
 
 
 # ------- Manual mask editor helpers ------------------------------------------
@@ -299,323 +293,288 @@ def _apply_strokes(
     return np.clip(new_mask, 0.0, 1.0)
 
 
-# ------- Sprite + per-upload caches ------------------------------------------
-@st.cache_resource(show_spinner="Loading people sprites…")
-def _load_sprites_cached(path: str):
-    return load_sprites(path)
+# ------- Studio controls and reusable composition ---------------------------
+_light_compass = components.declare_component("crowd_light_compass", path=str(HERE / "components" / "light_compass"))
 
 
-sprites = _load_sprites_cached(str(SPRITES_DIR))
-if not sprites:
-    st.error(f"No PNG sprites found in `{SPRITES_DIR}`.")
-    st.stop()
-st.sidebar.success(f"Loaded {len(sprites)} people sprites")
+@st.cache_resource(show_spinner="Preparing people motifs…")
+def _load_sprites_cached(path: str, clean: bool):
+    return load_sprites(path, remove_baked_shadows=clean)
+
+
+def _apply_mode_defaults():
+    portrait = st.session_state["input_type"] == "Portrait"
+    st.session_state["people_requested"] = 2200 if portrait else 2000
+    st.session_state["person_height_percent"] = 0.7 if portrait else 1.0
+    st.session_state["tone_contrast"] = 2.8 if portrait else 1.0
+    st.session_state["people_palette"] = "Ink with color accents" if portrait else "Original motif colors"
+
+
+def _shuffle_seed():
+    st.session_state["random_seed"] = secrets.randbelow(2**31)
+    st.session_state["shuffle_requested"] = True
 
 
 with st.sidebar:
-    st.header("Settings")
-    subject_only = st.toggle(
-        "Focus on subject only", value=True,
-        help="Auto-removes the background so figures only land on the person/subject. "
-             "First run downloads a ~170MB model.",
-    )
-    subject_model = st.selectbox(
-        "Subject detector",
-        options=["u2net_human_seg", "u2net", "isnet-general-use"],
-        index=0,
-        help="Use the human-seg model for portraits. Switch to 'u2net' / 'isnet' for "
-             "non-human subjects (objects, animals, paintings).",
-        disabled=not subject_only,
-    )
-    output_size = st.slider(
-        "Preview size (px, longest side)", 800, 4000, 2000, 200,
-        help="Resolution used for the on-screen preview render. Use the print presets "
-             "below to render at higher physical sizes.",
-    )
-    density_count = st.slider("Crowd density (figures placed)", 200, 10000, 2800, 100)
-    scatter_count = st.slider(
-        "Background scatter (stragglers)", 0, 500, 0, 5,
-        help="Stragglers placed anywhere on the canvas, ignoring the subject mask. "
-             "Set to 0 to keep figures strictly on the subject.",
-    )
-
-    st.markdown("**Face emphasis**")
-    face_boost = st.slider(
-        "Face boost", 1.0, 4.0, 2.4, 0.1,
-        help="Multiplier on density inside the detected face. 1.0 = body and face equal; "
-             "2.4 = face gets ~2.4× the figures of shoulders/torso.",
-    )
-    detail_strength = st.slider(
-        "Detail enhancement", 0.0, 1.5, 0.6, 0.1,
-        help="Sharpens edges before density extraction so eyes, lips, glasses, and hair "
-             "strands register as denser regions.",
-    )
-    color_match_strength = st.slider(
-        "Match input colors", 0.0, 0.7, 0.25, 0.05,
-        help="Tints each figure toward the input image's color at its position. "
-             "0 = keep original sprite colors; higher values blend the figure's clothing "
-             "toward the underlying subject color (red tie → reddish figures, etc.).",
-    )
-
-    st.markdown("**Crowd behavior**")
-    selectivity = st.slider(
-        "Selectivity", 1.0, 6.0, 3.0, 0.2,
-        help="How tightly figures cluster on dark features. Higher = sharper portrait, more empty space.",
-    )
-    min_density = st.slider(
-        "Density floor", 0.00, 0.50, 0.10, 0.02,
-        help="Pixels lighter than this never receive figures — keeps the background clean.",
-    )
-    sprite_height_pct = st.slider(
-        "Person size (% of canvas height)", 0.008, 0.040, 0.015, 0.001,
-        help="Smaller figures resolve finer features (eyes, mouth) but need more figures total.",
-    )
-    scale_jitter = st.slider("Size variation", 0.00, 0.50, 0.18, 0.05)
-    gamma = st.slider(
-        "Contrast (gamma)", 0.5, 3.0, 2.0, 0.1,
-        help="Higher = denser dark areas, sharper crowd shapes.",
-    )
-    blur = st.slider("Smoothing radius", 0.0, 6.0, 1.0, 0.5)
-    bg_hex = st.color_picker("Background color", "#F5F0E6")
-    paper_grain = st.slider("Paper grain", 0.00, 0.05, 0.015, 0.005)
-    seed_input = st.number_input(
-        "Random seed (0 = random)", min_value=0, max_value=999_999, value=0, step=1
-    )
-
-uploaded = st.file_uploader(
-    "Input image", type=["png", "jpg", "jpeg", "webp", "bmp", "tiff"]
-)
-
-if uploaded is None:
-    st.info("Upload an image to begin. Tip: portraits with strong shadows look best.")
-    st.stop()
-
-raw_bytes = uploaded.getvalue()
-input_img = Image.open(io.BytesIO(raw_bytes))
-
-
-@st.cache_data(show_spinner="Extracting subject (first run downloads a ~170MB model)…")
-def _cached_subject_mask(image_bytes: bytes, model: str) -> np.ndarray:
-    img = Image.open(io.BytesIO(image_bytes))
-    return extract_subject_mask(img, model=model)
-
-
-subject_mask: Optional[np.ndarray] = None
-if subject_only:
+    for key, value in {"people_requested": 2200, "person_height_percent": 0.7,
+                       "tone_contrast": 2.8, "random_seed": 42,
+                       "people_palette": "Ink with color accents"}.items():
+        st.session_state.setdefault(key, value)
+    st.header("Composition")
+    mode_label = st.selectbox("Input type", ["Portrait", "Text / logo", "Object / silhouette"], key="input_type", on_change=_apply_mode_defaults)
+    mode = {"Portrait": "portrait", "Text / logo": "text", "Object / silhouette": "silhouette"}[mode_label]
+    polarity_label = st.selectbox("Reconstruct", ["Dark areas on light background", "Light areas on dark background"])
+    polarity = "dark" if polarity_label.startswith("Dark") else "light"
+    subject_only = st.toggle("Remove input background", value=True, disabled=mode == "text",
+        help="Use for a person or object against a busy background. Letters and logos do not need an AI subject detector.")
+    subject_only = subject_only and mode != "text"
+    subject_model = st.selectbox("Subject detector", ["u2net_human_seg", "u2net", "isnet-general-use"],
+        index=0 if mode == "portrait" else 2, disabled=not subject_only)
+    density_count = st.slider("People requested", 200, 20000, value=None, step=200, key="people_requested")
+    sprite_height_pct = st.slider("Person height (% of long edge)", 0.3, 3.0, value=None, step=0.1, key="person_height_percent") / 100
+    spacing = st.slider("Space between people", 0.0, 1.0, 0.15, 0.05,
+        help="Minimum extra gap as a fraction of each person's width and height. If people cannot fit, fewer will be placed.")
+    scatter_count = st.slider("People outside the image", 0, 300, 20, 5)
+    seed_input = st.number_input("Arrangement seed", 0, 2**31 - 1, value=None, key="random_seed")
+    st.button("Shuffle and generate", on_click=_shuffle_seed, width="stretch")
+    with st.expander("Tone and detail"):
+        gamma = st.slider("Tone contrast", 0.5, 4.0, value=None, step=0.1, key="tone_contrast")
+        detail_strength = st.slider("Feature enhancement", 0.0, 1.5, 0.4, 0.1)
+        blur = st.slider("Input smoothing", 0.0, 3.0, 0.5, 0.1)
+        min_density = st.slider("Ignore faint tones", 0.0, 0.3, 0.035, 0.005)
+        face_boost = st.slider("Face emphasis", 1.0, 2.5, 1.0, 0.1, disabled=mode != "portrait")
+        scale_jitter = st.slider("Person size variation", 0.0, 0.3, 0.12, 0.02)
+        iterations = st.slider("Spacing refinement passes", 0, 12, 6)
+    st.header("Light and finish")
+    clean_sprites = st.toggle("Separate people from painted shadows", value=True,
+        help="Automatic cleanup of the existing motifs. Inspect pale clothing in the motif preview; clean transparent motifs are best for final prints.")
+    shadow_enabled = st.toggle("Cast shadows", value=True, disabled=not clean_sprites)
+    shadow_enabled = shadow_enabled and clean_sprites
+    compass_value = _light_compass(angle=225, default=225, key="sun_compass")
     try:
-        subject_mask = _cached_subject_mask(raw_bytes, subject_model)
-        if float(subject_mask.max()) < 0.05:
-            st.warning("Subject extraction returned an empty mask — falling back to whole image.")
-            subject_mask = None
-    except Exception as exc:
-        st.warning(f"Subject extraction unavailable ({exc}); falling back to whole image.")
-        subject_mask = None
+        sun_angle = float(compass_value) % 360
+    except (TypeError, ValueError):
+        sun_angle = 225.0
+    if not np.isfinite(sun_angle):
+        sun_angle = 225.0
+    sun_elevation = st.slider("Sun height", 15, 80, 45, help="A lower sun makes longer shadows.")
+    shadow_opacity = st.slider("Shadow strength", 0.0, 0.5, 0.23, 0.01)
+    shadow_softness = st.slider("Shadow softness", 0.0, 0.12, 0.035, 0.005)
+    bg_hex = st.color_picker("Canvas color", "#F5F0E6")
+    palette_label = st.selectbox("People palette", ["Ink with color accents", "Original motif colors"], index=None, key="people_palette")
+    figure_palette = "ink" if palette_label.startswith("Ink") else "natural"
+    color_match_strength = st.slider("Match clothing to input colors", 0.0, 0.9, 0.0, 0.05)
+    paper_grain = st.slider("Paper texture", 0.0, 0.02, 0.003, 0.001)
+    output_size = st.select_slider("Preview long edge (pixels)", [1000, 1500, 2000, 2500, 3000], value=1500)
+
+sprites = _load_sprites_cached(str(SPRITES_DIR), clean_sprites)
+if not sprites:
+    st.error("No usable PNG motifs found in Artwork people.")
+    st.stop()
+st.sidebar.caption(f"{len(sprites)} usable motifs · composition seed {seed_input}")
+
+with st.expander("Inspect the motif library"):
+    st.caption("The source files are preserved. Automatic cleanup removes the old cool-gray shadows; check that clothing and accessories remain intact. Replace motifs with shadow-free transparent PNGs for the best print results.")
+    cols = st.columns(8)
+    for index, sprite in enumerate(sprites):
+        with cols[index % 8]:
+            st.image(sprite, caption=f"Motif {index + 1}", width="stretch")
+
+uploaded = st.file_uploader("Input image", type=["png", "jpg", "jpeg", "webp", "bmp", "tiff"])
+if uploaded is None:
+    st.info("Upload a portrait, lettering or an object. Start with a clean background and clearly visible details.")
+    st.stop()
+raw_bytes = uploaded.getvalue()
+input_img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw_bytes)))
+upload_key = hashlib.sha256(raw_bytes).hexdigest()
+if st.session_state.get("upload_key") != upload_key:
+    st.session_state["upload_key"] = upload_key
+    for key in ("layout", "output", "output_meta", "manual_mask", "render_options", "export_buffers"):
+        st.session_state.pop(key, None)
+    st.session_state["mask_canvas_key"] = 0
+
+
+@st.cache_data(show_spinner="Extracting subject (first run downloads a model)…")
+def _cached_subject_mask(image_bytes: bytes, model: str):
+    return extract_subject_mask(ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))), model=model)
 
 
 @st.cache_data(show_spinner=False)
 def _cached_face_bbox(image_bytes: bytes):
-    img = Image.open(io.BytesIO(image_bytes))
-    return detect_face_bbox(img)
+    return detect_face_bbox(ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))))
 
 
-face_bbox = _cached_face_bbox(raw_bytes) if face_boost > 1.0 else None
-
-# Clear last render when a new image is uploaded.
-upload_key = uploaded.name + ":" + str(len(raw_bytes))
-if st.session_state.get("upload_key") != upload_key:
-    st.session_state["upload_key"] = upload_key
-    st.session_state.pop("output", None)
-    st.session_state.pop("output_meta", None)
-    st.session_state.pop("manual_mask", None)
-    st.session_state["mask_canvas_key"] = 0
-
-# Manual mask edits override the auto-detected mask if present.
-manual_mask: Optional[np.ndarray] = st.session_state.get("manual_mask")
+subject_mask = None
+if subject_only:
+    try:
+        subject_mask = _cached_subject_mask(raw_bytes, subject_model)
+        if float(subject_mask.max()) < 0.05:
+            st.warning("Subject extraction found no subject. Whole-image reconstruction is available.")
+            subject_mask = None
+    except Exception as exc:
+        st.warning(f"Background removal unavailable: {exc}. Whole-image reconstruction is available.")
+face_bbox = _cached_face_bbox(raw_bytes) if mode == "portrait" and face_boost > 1 else None
+manual_mask = st.session_state.get("manual_mask")
 effective_subject_mask = manual_mask if manual_mask is not None else subject_mask
 
-
-# ------- Render helper -------------------------------------------------------
-def _do_render(target_size: int, label: str) -> None:
-    progress = st.progress(0.0, text=f"Rendering {label} ({target_size}px longest side)…")
-
-    def _cb(p: float) -> None:
-        progress.progress(min(max(p, 0.0), 1.0),
-                          text=f"Rendering {label} ({target_size}px longest side)…")
-
-    output = generate_crowd(
-        input_img,
-        sprites,
-        output_size=target_size,
-        density_count=density_count,
-        scatter_count=scatter_count,
-        sprite_height_pct=sprite_height_pct,
-        scale_jitter=scale_jitter,
-        gamma=gamma,
-        blur=blur,
-        selectivity=selectivity,
-        min_density=min_density,
-        detail_strength=detail_strength,
-        face_boost=face_boost,
-        face_bbox=face_bbox,
-        color_match_strength=color_match_strength,
-        subject_only=subject_only,
-        subject_mask=effective_subject_mask,
-        background_color=hex_to_rgb(bg_hex),
-        paper_grain=paper_grain,
-        seed=None if seed_input == 0 else int(seed_input),
-        progress_callback=_cb,
-    )
-    progress.empty()
-    st.session_state["output"] = output
-    st.session_state["output_meta"] = {"label": label, "size_px": output.size}
+layout_options = dict(density_count=density_count, scatter_count=scatter_count,
+    sprite_height_pct=sprite_height_pct, spacing=spacing, iterations=iterations,
+    gamma=gamma, blur=blur, detail_strength=detail_strength, min_density=min_density,
+    face_boost=face_boost if mode == "portrait" else 1.0, face_bbox=face_bbox,
+    scale_jitter=scale_jitter, mode=mode, polarity=polarity, seed=int(seed_input))
+render_options = dict(background_color=hex_to_rgb(bg_hex), paper_grain=paper_grain,
+    color_match_strength=color_match_strength, figure_palette=figure_palette, shadow_enabled=shadow_enabled,
+    sun_angle=sun_angle, sun_elevation=sun_elevation, shadow_opacity=shadow_opacity,
+    shadow_softness=shadow_softness)
 
 
-# ------- Layout: input + generate --------------------------------------------
+@st.cache_data(show_spinner=False, max_entries=6)
+def _composition_cached(image_bytes: bytes, options_json: str, mask, clean: bool, _sprites):
+    image = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes)))
+    return create_layout(image, _sprites, subject_mask=mask, **json.loads(options_json))
+
+
+def _do_render(target_size: int, label: str, *, dimensions=None, dpi=None,
+               rebuild=False, refresh_style=False):
+    progress = st.progress(0.0, text="Preparing crowd artwork…")
+    try:
+        if rebuild or "layout" not in st.session_state:
+            layout = _composition_cached(raw_bytes, json.dumps(layout_options, sort_keys=True),
+                effective_subject_mask, clean_sprites, sprites)
+            st.session_state["layout"] = layout
+            st.session_state["layout_clean"] = clean_sprites
+            st.session_state["render_options"] = render_options.copy()
+        layout = st.session_state["layout"]
+        if refresh_style:
+            st.session_state["render_options"] = render_options.copy()
+        style = st.session_state["render_options"].copy()
+        # A saved composition always uses the library it was built with.
+        saved_sprites = _load_sprites_cached(str(SPRITES_DIR), st.session_state["layout_clean"])
+        style["shadow_enabled"] = style["shadow_enabled"] and st.session_state["layout_clean"]
+        image = render_layout(layout, saved_sprites, output_size=target_size,
+            dimensions=dimensions, progress_callback=lambda p: progress.progress(p, text="Rendering artwork…"), **style)
+    except (ValueError, MemoryError) as exc:
+        st.error(str(exc))
+        return False
+    finally:
+        progress.empty()
+    st.session_state["output"] = image
+    st.session_state["output_meta"] = dict(label=label, size_px=image.size, dpi=dpi,
+        seed=layout.seed, figures=len(layout.figures), requested=layout.requested + layout.requested_scatter)
+    st.session_state["export_buffers"] = {}
+    return True
+
+
+# Lighting/finish changes reuse the composition and refresh only a preview.
+if ("layout" in st.session_state and st.session_state.get("layout_clean") == clean_sprites
+        and st.session_state.get("render_options") != render_options):
+    _do_render(output_size, "preview", refresh_style=True)
+
 col_in, col_out = st.columns([1, 1])
 with col_in:
     st.subheader("Input")
-    if face_bbox is not None:
-        st.caption(f"✓ Face detected at {face_bbox} — face boost will apply.")
-    elif face_boost > 1.0:
-        st.caption("⚠ No face detected — face boost will have no effect.")
-    st.image(input_img, use_container_width=True)
-
-    # Subject mask preview + manual editor
-    has_mask = effective_subject_mask is not None
-    label = "Subject mask & manual editor"
-    if manual_mask is not None:
-        label += " · manual edits applied"
-    with st.expander(label, expanded=False):
-        if has_mask:
-            st.image(
-                (effective_subject_mask * 255).clip(0, 255).astype("uint8"),
-                caption=(
-                    "White = figures land here, black = ignored. "
-                    + ("Showing manually edited mask." if manual_mask is not None
-                       else "Showing auto-detected mask.")
-                ),
-                use_container_width=True,
-            )
-        else:
-            st.info(
-                "No mask available. Turn on **Focus on subject only** in the sidebar "
-                "to auto-detect a subject, or paint a mask from scratch below."
-            )
-
-        edit_on = st.toggle(
-            "Edit mask manually", value=False, key="edit_mask_toggle",
-            help="Paint to add regions (red brush) or remove regions (blue brush) the "
-                 "auto detector got wrong, e.g. missed hair tendrils or stray hands.",
-        )
+    st.image(input_img, width="stretch")
+    if face_bbox:
+        st.caption("Face detected; face emphasis is enabled.")
+    if max(input_img.size) < 800:
+        st.caption("This input is small. A sharper original can improve facial features and fine lettering.")
+    with st.expander("Subject mask and manual touch-up"):
+        if effective_subject_mask is not None:
+            st.image((effective_subject_mask * 255).clip(0, 255).astype("uint8"),
+                caption="White areas receive people. Black areas remain empty.", width="stretch")
+        edit_on = st.toggle("Edit mask manually", value=False, key="edit_mask_toggle")
         if edit_on:
-            brush_mode = st.radio(
-                "Brush", ["Add to mask (red)", "Remove from mask (blue)"],
-                horizontal=True, key="brush_mode",
-            )
-            stroke_color = (ADD_BRUSH_HEX if brush_mode.startswith("Add")
-                            else REMOVE_BRUSH_HEX)
-            brush_size = st.slider("Brush size", 5, 80, 28, key="brush_size")
-
-            cw, ch = _canvas_dims(input_img, max_side=700)
-            canvas_key = f"mask_canvas_{st.session_state.get('mask_canvas_key', 0)}"
-            canvas_result = st_canvas(
-                fill_color="rgba(0,0,0,0)",
-                stroke_width=brush_size,
-                stroke_color=stroke_color,
-                background_image=input_img.convert("RGB"),
-                update_streamlit=True,
-                height=ch,
-                width=cw,
-                drawing_mode="freedraw",
-                key=canvas_key,
-            )
-
+            brush_mode = st.radio("Brush", ["Add to mask (red)", "Remove from mask (blue)"], horizontal=True)
+            brush_size = st.slider("Brush size", 5, 80, 28)
+            cw, ch = _canvas_dims(input_img)
+            canvas_result = st_canvas(fill_color="rgba(0,0,0,0)", stroke_width=brush_size,
+                stroke_color=ADD_BRUSH_HEX if brush_mode.startswith("Add") else REMOVE_BRUSH_HEX,
+                background_image=input_img.convert("RGB"), update_streamlit=True,
+                width=cw, height=ch, drawing_mode="freedraw",
+                key=f"mask_canvas_{st.session_state.get('mask_canvas_key', 0)}")
             b1, b2, b3 = st.columns(3)
             with b1:
-                if st.button("Apply edits", use_container_width=True, type="primary"):
-                    if (canvas_result.image_data is not None
-                            and np.asarray(canvas_result.image_data)[..., 3].max() > 0):
-                        target_hw = (
-                            subject_mask.shape if subject_mask is not None
-                            else (input_img.height, input_img.width)
-                        )
-                        st.session_state["manual_mask"] = _apply_strokes(
-                            subject_mask, canvas_result.image_data, target_hw
-                        )
-                        st.session_state["mask_canvas_key"] = (
-                            st.session_state.get("mask_canvas_key", 0) + 1
-                        )
+                if st.button("Apply mask edits"):
+                    if canvas_result.image_data is not None and np.asarray(canvas_result.image_data)[..., 3].max() > 0:
+                        target = subject_mask.shape if subject_mask is not None else (input_img.height, input_img.width)
+                        base = manual_mask if manual_mask is not None else subject_mask
+                        st.session_state["manual_mask"] = _apply_strokes(base, canvas_result.image_data, target)
+                        st.session_state["mask_canvas_key"] += 1
                         st.rerun()
-                    else:
-                        st.warning("Nothing to apply — paint some strokes first.")
             with b2:
-                if st.button("Clear strokes", use_container_width=True):
-                    st.session_state["mask_canvas_key"] = (
-                        st.session_state.get("mask_canvas_key", 0) + 1
-                    )
+                if st.button("Clear strokes"):
+                    st.session_state["mask_canvas_key"] += 1
                     st.rerun()
             with b3:
-                if st.button("Reset to auto", use_container_width=True,
-                             disabled=manual_mask is None):
+                if st.button("Reset mask"):
                     st.session_state.pop("manual_mask", None)
-                    st.session_state["mask_canvas_key"] = (
-                        st.session_state.get("mask_canvas_key", 0) + 1
-                    )
+                    st.session_state["mask_canvas_key"] += 1
                     st.rerun()
+        st.caption("Generate a new preview after changing the mask or composition controls.")
 
 with col_out:
-    st.subheader("Crowd canvas")
-    if st.button("Generate preview", type="primary", use_container_width=True):
-        _do_render(output_size, "preview")
-
-    out_meta = st.session_state.get("output_meta")
-    if out_meta:
-        w, h = out_meta["size_px"]
-        st.caption(
-            f"Showing **{out_meta['label']}** · {w} × {h} px · "
-            f"~{w * h / 1_000_000:.1f} megapixels"
-        )
-        out_img = st.session_state["output"]
-        buf = io.BytesIO()
-        out_img.save(buf, format="PNG", optimize=True)
-        st.download_button(
-            "Download full-resolution PNG",
-            data=buf.getvalue(),
-            file_name=f"crowdcanvas_{out_meta['label'].replace(' ', '_')}.png",
-            mime="image/png",
-            use_container_width=True,
-        )
+    st.subheader("Crowd artwork")
+    generate = st.button("Generate preview", type="primary", width="stretch")
+    if generate or st.session_state.pop("shuffle_requested", False):
+        _do_render(output_size, "preview", rebuild=True)
+    if "output" in st.session_state:
+        image = st.session_state["output"]
+        meta = st.session_state["output_meta"]
+        st.image(image, width="stretch")
+        w, h = meta["size_px"]
+        st.caption(f"{meta['label']} · {w:,} × {h:,} px · {meta['figures']:,} people · seed {meta['seed']}")
+        if meta["figures"] < meta["requested"]:
+            st.caption("Fewer people fit while keeping the chosen gaps. Reduce person size or spacing to fit more.")
+        if image.info.get("max_sprite_upscale", 0) > 1:
+            st.warning("Some motifs are enlarged beyond their original pixels. Smaller figures or higher-resolution motifs will print more sharply.")
+        file_format = st.selectbox("Download format", ["PNG", "TIFF"])
+        buffers = st.session_state["export_buffers"]
+        if file_format not in buffers:
+            buf = io.BytesIO()
+            options = {"icc_profile": ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()}
+            if meta["dpi"]:
+                options["dpi"] = (meta["dpi"], meta["dpi"])
+            if file_format == "TIFF":
+                options["compression"] = "tiff_lzw"
+            image.save(buf, format=file_format, **options)
+            buffers[file_format] = buf.getvalue()
+        extension = "png" if file_format == "PNG" else "tif"
+        st.download_button(f"Download {file_format}", buffers[file_format],
+            file_name=f"crowdcanvas_{w}x{h}_seed{meta['seed']}.{extension}",
+            mime="image/png" if file_format == "PNG" else "image/tiff", width="stretch")
     else:
-        st.caption("Press **Generate preview** to render at the sidebar's preview size.")
+        st.caption("Generate a preview to compose the artwork. The same arrangement is reused for every export.")
 
-# ------- Print / display preset row ------------------------------------------
-if st.session_state.get("output") is not None:
-    st.markdown("---")
-    st.subheader("Render at print or display size")
-    st.caption(
-        "Each preset re-runs the algorithm at the target pixel resolution while "
-        "preserving your input's aspect ratio. Larger sizes take longer."
-    )
-    cols_per_row = 4
-    for row_start in range(0, len(PRINT_PRESETS), cols_per_row):
-        cols = st.columns(cols_per_row)
-        for i, preset in enumerate(PRINT_PRESETS[row_start:row_start + cols_per_row]):
-            with cols[i]:
-                if st.button(
-                    preset["label"],
-                    key=f"preset_{row_start + i}",
-                    use_container_width=True,
-                    help=f"{preset['physical']} · {preset['longest_px']} px longest side",
-                ):
-                    _do_render(preset["longest_px"], preset["label"])
+if "layout" in st.session_state:
+    st.divider()
+    st.subheader("Print dimensions")
+    st.caption("Exports use the displayed arrangement. If the frame has a different shape, the artwork is centered with blank margins and keeps its proportions.")
+    orientation = st.radio("Preset orientation", ["Portrait", "Landscape"], horizontal=True)
+    cols = st.columns(3)
+    for index, (label, wc, hc, dpi) in enumerate(PRINT_PRESETS):
+        if orientation == "Landscape":
+            wc, hc = hc, wc
+        with cols[index % 3]:
+            if st.button(f"{label} · {dpi} DPI", width="stretch"):
+                dims = print_dimensions(wc, hc, dpi)
+                if _do_render(max(dims), f"{wc:g} × {hc:g} cm at {dpi} DPI", dimensions=dims, dpi=dpi):
                     st.rerun()
-                st.caption(f"{preset['longest_px']}px · {preset['physical']}")
-
-    # ------- Zoom / pan viewer ----------------------------------------------
-    st.markdown("---")
-    st.subheader("Zoom in & inspect the figures")
-    st.caption(
-        "Drag to pan, scroll to zoom (centered on the cursor), or use the buttons. "
-        "On touch devices, pinch to zoom."
-    )
-    render_zoom_viewer(st.session_state["output"], height_px=720)
+    with st.expander("Custom size", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        wc = c1.number_input("Width (cm)", 5.0, 200.0, 50.0, 1.0)
+        hc = c2.number_input("Height (cm)", 5.0, 200.0, 70.0, 1.0)
+        dpi = c3.selectbox("Print DPI", [150, 200, 240, 300], index=2)
+        try:
+            dims = print_dimensions(wc, hc, dpi)
+            st.caption(f"{dims[0]:,} × {dims[1]:,} pixels · {dims[0] * dims[1] / 1e6:.1f} megapixels")
+            if st.button("Render custom print", type="primary"):
+                if _do_render(max(dims), f"{wc:g} × {hc:g} cm at {dpi} DPI", dimensions=dims, dpi=dpi):
+                    st.rerun()
+        except ValueError as exc:
+            st.info(str(exc))
+    if st.button("Return to preview"):
+        _do_render(output_size, "preview")
+        st.rerun()
+    st.divider()
+    st.subheader("Inspect the people")
+    render_zoom_viewer(st.session_state["output"], height_px=650)
