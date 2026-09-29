@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8">
+<style>
+body { margin:0; font:13px system-ui,sans-serif; color:#444; }
+.wrap { display:flex; flex-direction:column; align-items:center; gap:3px; }
+svg { width:210px; height:185px; touch-action:none; user-select:none; }
+#sun { cursor:grab; } #sun:active { cursor:grabbing; }
+.hint { color:#777; font-size:12px; }
+</style>
+<div class="wrap">
+<svg viewBox="0 0 220 190" role="slider" tabindex="0" aria-label="Sun direction" aria-valuemin="0" aria-valuemax="359">
+<circle cx="110" cy="92" r="70" fill="none" stroke="#d5d5d5" stroke-dasharray="3 5"/>
+<line id="shadow" x1="110" y1="92" x2="145" y2="127" stroke="#9ca3af" stroke-width="13" stroke-linecap="round" opacity=".35"/>
+<circle cx="110" cy="83" r="7" fill="#25364a"/>
+<path d="M110 92 L110 109 M102 96 L118 96 M110 109 L103 119 M110 109 L117 119" stroke="#25364a" stroke-width="4" stroke-linecap="round" fill="none"/>
+<line id="ray" x1="110" y1="92" x2="60" y2="42" stroke="#e9b54d" stroke-dasharray="3 4"/>
+<g id="sun"><circle r="17" fill="#ffe5a0" stroke="#d89b26" stroke-width="2"/><circle r="9" fill="#ffc94d"/></g>
+<text x="110" y="184" text-anchor="middle" id="label">Sun direction</text>
+</svg>
+<div class="hint">Drag the sun · arrow keys also work</div>
+</div>
+<script>
+const svg=document.querySelector('svg'), sun=document.getElementById('sun');
+let angle=225, dragging=false, initialized=false;
+function send(type, data={}) { window.parent.postMessage({isStreamlitMessage:true,type,...data},'*'); }
+function draw() {
+  const r=angle*Math.PI/180, x=110+70*Math.cos(r), y=92+70*Math.sin(r);
+  sun.setAttribute('transform',`translate(${x},${y})`);
+  const ray=document.getElementById('ray'); ray.setAttribute('x2',x);ray.setAttribute('y2',y);
+  const shadow=document.getElementById('shadow');shadow.setAttribute('x2',110-43*Math.cos(r));shadow.setAttribute('y2',92-43*Math.sin(r));
+  document.getElementById('label').textContent=`Sun ${Math.round(angle)}°`;
+  svg.setAttribute('aria-valuenow', Math.round(angle));
+}
+function commit() { send('streamlit:setComponentValue',{value:angle,dataType:'json'}); }
+function move(e) {
+  const p=svg.createSVGPoint();p.x=e.clientX;p.y=e.clientY;
+  const local=p.matrixTransform(svg.getScreenCTM().inverse());
+  angle=(Math.atan2(local.y-92,local.x-110)*180/Math.PI+360)%360;
+  draw();
+}
+svg.addEventListener('pointerdown',e=>{dragging=true;svg.setPointerCapture(e.pointerId);move(e);});
+svg.addEventListener('pointermove',e=>{if(dragging) move(e);});
+svg.addEventListener('pointerup',e=>{if(dragging){move(e);dragging=false;commit();}});
+svg.addEventListener('pointercancel',()=>{dragging=false;});
+svg.addEventListener('keydown',e=>{
+  if(['ArrowLeft','ArrowUp','ArrowRight','ArrowDown'].includes(e.key)) {
+    e.preventDefault();angle=(angle+(['ArrowLeft','ArrowUp'].includes(e.key)?-5:5)+360)%360;draw();commit();
+  }
+});
+window.addEventListener('message',e=>{
+  if(e.data.type==='streamlit:render'){
+    if(!initialized){angle=Number(e.data.args.angle??225);initialized=true;draw();}
+    const theme=e.data.theme;if(theme) document.body.style.color=theme.textColor;
+    send('streamlit:setFrameHeight',{height:215});
+  }
+});
+draw();send('streamlit:componentReady',{apiVersion:1});send('streamlit:setFrameHeight',{height:215});
+</script></html>
